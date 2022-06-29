@@ -36,6 +36,7 @@
 #include <ell/ell.h>
 #include <gatchat.h>
 #include <gattty.h>
+#include <gatmux.h>
 
 #define OFONO_API_SUBJECT_TO_CHANGE
 #include <ofono.h>
@@ -63,7 +64,7 @@ static const char *cpin_prefix[] = { "+CPIN:", NULL };
 static const char *cbc_prefix[] = { "+CBC:", NULL };
 static const char *qinistat_prefix[] = { "+QINISTAT:", NULL };
 static const char *cgmm_prefix[] = { "UC15", "Quectel_M95", "Quectel_MC60",
-					NULL };
+					"EC21", "EC200", NULL };
 static const char *none_prefix[] = { NULL };
 
 static const uint8_t gsm0710_terminate[] = {
@@ -82,23 +83,31 @@ enum quectel_model {
 	QUECTEL_UC15,
 	QUECTEL_M95,
 	QUECTEL_MC60,
+	QUECTEL_EC21,
+	QUECTEL_EC200,
 };
 
 struct quectel_data {
 	GAtChat *modem;
 	GAtChat *aux;
-	guint cpin_ready;
-	guint call_ready;
-	bool have_sim;
 	enum ofono_vendor vendor;
 	enum quectel_model model;
-	struct l_timeout *sms_ready_timer;
+	struct at_util_sim_state_query *sim_state_query;
+	unsigned int sim_watch;
+	bool sim_locked;
+	bool sim_ready;
 
 	/* used by quectel uart driver */
+	GIOChannel *device;
 	GAtChat *uart;
+	GAtMux *mux;
 	int mux_ready_count;
 	int initial_ldisc;
 	struct l_gpio_writer *gpio;
+	struct l_timeout *init_timeout;
+	struct l_timeout *gpio_timeout;
+	size_t init_count;
+	guint init_cmd;
 };
 
 struct dbus_hw {
@@ -118,6 +127,15 @@ enum quectel_power_event {
 };
 
 static const char dbus_hw_interface[] = OFONO_SERVICE ".quectel.Hardware";
+
+static ofono_bool_t has_serial_connection(struct ofono_modem *modem)
+{
+
+	if (ofono_modem_get_string(modem, "Device"))
+		return TRUE;
+
+	return FALSE;
+}
 
 static void quectel_debug(const char *str, void *user_data)
 {
@@ -182,44 +200,60 @@ static void quectel_remove(struct ofono_modem *modem)
 
 	DBG("%p", modem);
 
-	if (data->cpin_ready != 0)
-		g_at_chat_unregister(data->aux, data->cpin_ready);
-
 	ofono_modem_set_data(modem, NULL);
+	l_timeout_remove(data->init_timeout);
+	l_timeout_remove(data->gpio_timeout);
 	l_gpio_writer_free(data->gpio);
+	at_util_sim_state_query_free(data->sim_state_query);
 	g_at_chat_unref(data->aux);
 	g_at_chat_unref(data->modem);
 	g_at_chat_unref(data->uart);
+	g_at_mux_unref(data->mux);
+
+	if (data->device)
+		g_io_channel_unref(data->device);
+
 	l_free(data);
 }
 
-static void close_mux_cb(struct l_timeout *timeout, void *user_data)
+static void close_mux(struct ofono_modem *modem)
 {
-	struct ofono_modem *modem = user_data;
 	struct quectel_data *data = ofono_modem_get_data(modem);
-	GIOChannel *device;
-	uint32_t gpio_value = 0;
-	ssize_t write_count;
+
+	DBG("%p", modem);
+
+	g_io_channel_unref(data->device);
+	data->device = NULL;
+
+	g_at_mux_unref(data->mux);
+	data->mux = NULL;
+}
+
+static void close_ngsm(struct ofono_modem *modem)
+{
+	struct quectel_data *data = ofono_modem_get_data(modem);
 	int fd;
 
 	DBG("%p", modem);
 
-	device = g_at_chat_get_channel(data->uart);
-	fd = g_io_channel_unix_get_fd(device);
+	if (!data->device)
+		return;
+
+	fd = g_io_channel_unix_get_fd(data->device);
 
 	/* restore initial tty line discipline */
 	if (ioctl(fd, TIOCSETD, &data->initial_ldisc) < 0)
 		ofono_warn("Failed to restore line discipline");
+}
 
-	/* terminate gsm 0710 multiplexing on the modem side */
-	write_count = write(fd, gsm0710_terminate, sizeof(gsm0710_terminate));
-	if (write_count != sizeof(gsm0710_terminate))
-		ofono_warn("Failed to terminate gsm multiplexing");
-
-	g_at_chat_unref(data->uart);
-	data->uart = NULL;
+static void gpio_power_off_cb(struct l_timeout *timeout, void *user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	const uint32_t gpio_value = 0;
 
 	l_timeout_remove(timeout);
+	data->gpio_timeout = NULL;
 	l_gpio_writer_set(data->gpio, 1, &gpio_value);
 	ofono_modem_set_powered(modem, FALSE);
 }
@@ -227,8 +261,12 @@ static void close_mux_cb(struct l_timeout *timeout, void *user_data)
 static void close_serial(struct ofono_modem *modem)
 {
 	struct quectel_data *data = ofono_modem_get_data(modem);
+	uint32_t gpio_value = 1;
 
 	DBG("%p", modem);
+
+	at_util_sim_state_query_free(data->sim_state_query);
+	data->sim_state_query = NULL;
 
 	g_at_chat_unref(data->aux);
 	data->aux = NULL;
@@ -236,19 +274,29 @@ static void close_serial(struct ofono_modem *modem)
 	g_at_chat_unref(data->modem);
 	data->modem = NULL;
 
-	/*
-	 * if gsm0710 multiplexing is used, the aux and modem file descriptors
-	 * must be closed before closing the underlying serial device to avoid
-	 * an old kernel dead-lock:
-	 * https://lists.ofono.org/pipermail/ofono/2011-March/009405.html
-	 *
-	 * setup a timer to iterate the mainloop once to let gatchat close the
-	 * virtual file descriptors unreferenced above
-	 */
-	if (data->uart)
-		l_timeout_create_ms(1, close_mux_cb, modem, NULL);
+	g_at_chat_unref(data->uart);
+	data->uart = NULL;
+
+	if (data->mux)
+		close_mux(modem);
 	else
-		ofono_modem_set_powered(modem, false);
+		close_ngsm(modem);
+
+	if (data->gpio) {
+		if (ofono_modem_get_boolean(modem, "GpioLevel")) {
+			gpio_value = 0;
+			l_gpio_writer_set(data->gpio, 1, &gpio_value);
+		} else {
+			l_gpio_writer_set(data->gpio, 1, &gpio_value);
+			l_timeout_remove(data->gpio_timeout);
+			data->gpio_timeout = l_timeout_create_ms(750,
+							gpio_power_off_cb,
+							modem, NULL);
+			return;
+		}
+	}
+
+	ofono_modem_set_powered(modem, FALSE);
 }
 
 static void dbus_hw_reply_properties(struct dbus_hw *hw)
@@ -361,27 +409,27 @@ static void voltage_handle(struct ofono_modem *modem,
 	case LOW_POWER_DOWN:
 		close = true;
 		name = "PowerDown";
-		reason = "VoltageLow";
+		reason = "voltagelow";
 		break;
 	case LOW_WARNING:
 		close = false;
 		name = "PowerWarning";
-		reason = "VoltageLow";
+		reason = "voltagelow";
 		break;
 	case NORMAL_POWER_DOWN:
 		close = true;
 		name = "PowerDown";
-		reason = "Normal";
+		reason = "normal";
 		break;
 	case HIGH_WARNING:
 		close = false;
 		name = "PowerWarning";
-		reason = "VoltageHigh";
+		reason = "voltagehigh";
 		break;
 	case HIGH_POWER_DOWN:
 		close = true;
 		name = "PowerDown";
-		reason = "VoltageHigh";
+		reason = "voltagehigh";
 		break;
 	default:
 		return;
@@ -414,10 +462,12 @@ static void qind_notify(GAtResult *result, void *user_data)
 	if (!g_at_result_iter_next_string(&iter, &type))
 		return;
 
-	if (!g_at_result_iter_next_number(&iter, &event))
-		return;
+	if (g_strcmp0("vbatt", type)) {
+		if (!g_at_result_iter_next_number(&iter, &event))
+			return;
 
-	voltage_handle(hw->modem, event);
+		voltage_handle(hw->modem, event);
+	}
 }
 
 static void power_notify(GAtResult *result, void *user_data)
@@ -502,6 +552,8 @@ static void dbus_hw_enable(struct ofono_modem *modem)
 
 	switch (data->model) {
 	case QUECTEL_UC15:
+	case QUECTEL_EC21:
+	case QUECTEL_EC200:
 		g_at_chat_register(data->aux, "+QIND",  qind_notify, FALSE, hw,
 					NULL);
 		break;
@@ -523,12 +575,84 @@ static void dbus_hw_enable(struct ofono_modem *modem)
 	ofono_modem_add_interface(modem, dbus_hw_interface);
 }
 
-static void cpin_notify(GAtResult *result, gpointer user_data)
+static void qinistat_cb(gboolean ok, GAtResult *result, gpointer user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct ofono_sim *sim = ofono_modem_get_sim(modem);
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	GAtResultIter iter;
+	int ready = 0;
+	int status;
+
+	DBG("%p", modem);
+
+	g_at_result_iter_init(&iter, result);
+
+	if (!g_at_result_iter_next(&iter, "+QINISTAT:"))
+		return;
+
+	if (!g_at_result_iter_next_number(&iter, &status))
+		return;
+
+	DBG("qinistat: %d", status);
+
+	switch (data->model) {
+	case QUECTEL_UC15:
+	case QUECTEL_EC21:
+		/* UC15 uses a bitmap of 1 + 2 + 4 = 7 */
+		ready = 7;
+		break;
+	case QUECTEL_EC200:
+		/*
+		 * EC200T doesn't indicate that the Phonebook initialization
+		 * is completed (==4) when AT+CFUN=4, that's why 1 + 2 = 3
+		 */
+		ready = 3;
+		break;
+	case QUECTEL_M95:
+	case QUECTEL_MC60:
+		/* M95 and MC60 uses a counter to 3 */
+		ready = 3;
+		break;
+	case QUECTEL_UNKNOWN:
+		ready = 0;
+		break;
+	}
+
+	if (status != ready) {
+		l_timeout_modify_ms(data->init_timeout, 500);
+		return;
+	}
+
+	l_timeout_remove(data->init_timeout);
+	data->init_timeout = NULL;
+
+	if (data->sim_locked) {
+		ofono_sim_initialized_notify(sim);
+		return;
+	}
+
+	data->sim_ready = true;
+	ofono_modem_set_powered(modem, TRUE);
+}
+
+static void init_timer_cb(struct l_timeout *timeout, void *user_data)
 {
 	struct ofono_modem *modem = user_data;
 	struct quectel_data *data = ofono_modem_get_data(modem);
-	const char *sim_inserted;
+
+	DBG("%p", modem);
+
+	g_at_chat_send(data->aux, "AT+QINISTAT", qinistat_prefix, qinistat_cb,
+			modem, NULL);
+}
+
+static void sim_watch_cb(GAtResult *result, void *user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
 	GAtResultIter iter;
+	const char *cpin;
 
 	DBG("%p", modem);
 
@@ -537,28 +661,99 @@ static void cpin_notify(GAtResult *result, gpointer user_data)
 	if (!g_at_result_iter_next(&iter, "+CPIN:"))
 		return;
 
-	g_at_result_iter_next_unquoted_string(&iter, &sim_inserted);
+	g_at_result_iter_next_unquoted_string(&iter, &cpin);
 
-	if (g_strcmp0(sim_inserted, "NOT INSERTED") != 0)
-		data->have_sim = true;
+	if (g_strcmp0(cpin, "READY") != 0)
+		return;
 
-	ofono_modem_set_powered(modem, TRUE);
+	g_at_chat_unregister(data->aux, data->sim_watch);
+	data->sim_watch = 0;
 
-	/* Turn off the radio. */
-	g_at_chat_send(data->aux, "AT+CFUN=4", none_prefix, NULL, NULL, NULL);
-
-	g_at_chat_unregister(data->aux, data->cpin_ready);
-	data->cpin_ready = 0;
-
-	dbus_hw_enable(modem);
+	data->init_timeout = l_timeout_create_ms(500, init_timer_cb, modem, NULL);
 }
 
-static void cpin_query(gboolean ok, GAtResult *result, gpointer user_data)
+static void cpin_cb(gboolean ok, GAtResult *result, gpointer user_data)
 {
-	DBG("%p ok %d", user_data, ok);
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	const char *path = ofono_modem_get_path(modem);
+	GAtResultIter iter;
+	const char *cpin;
 
-	if (ok)
-		cpin_notify(result, user_data);
+	DBG("%p", modem);
+
+	if (!ok) {
+		close_serial(modem);
+		return;
+	}
+
+	g_at_result_iter_init(&iter, result);
+
+	if (!g_at_result_iter_next(&iter, "+CPIN:")) {
+		close_serial(modem);
+		return;
+	}
+
+	g_at_result_iter_next_unquoted_string(&iter, &cpin);
+
+	if (g_strcmp0(cpin, "READY") == 0) {
+		data->init_timeout = l_timeout_create_ms(500, init_timer_cb,
+								modem, NULL);
+		return;
+	}
+
+	if (g_strcmp0(cpin, "SIM PIN") != 0) {
+		close_serial(modem);
+		return;
+	}
+
+	ofono_info("%s: sim locked", path);
+	data->sim_locked = true;
+	data->sim_watch = g_at_chat_register(data->aux, "+CPIN:",
+						sim_watch_cb, FALSE,
+						modem, NULL);
+	ofono_modem_set_powered(modem, TRUE);
+}
+
+static void sim_state_cb(gboolean present, gpointer user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	const char *path = ofono_modem_get_path(modem);
+
+	DBG("%p present %d", modem, present);
+
+	at_util_sim_state_query_free(data->sim_state_query);
+	data->sim_state_query = NULL;
+	data->sim_locked = false;
+	data->sim_ready = false;
+
+	if (!present) {
+		ofono_modem_set_powered(modem, TRUE);
+		ofono_warn("%s: sim not present", path);
+		return;
+	}
+
+	g_at_chat_send(data->aux, "AT+CPIN?", cpin_prefix, cpin_cb, modem,
+			NULL);
+}
+
+static void cfun_cb(gboolean ok, GAtResult *result, gpointer user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+
+	DBG("%p ok %d", modem, ok);
+
+	if (!ok) {
+		close_serial(modem);
+		return;
+	}
+
+	dbus_hw_enable(modem);
+	data->sim_state_query = at_util_sim_state_query_new(data->aux,
+						2, 20, sim_state_cb, modem,
+						NULL);
 }
 
 static void cfun_enable(gboolean ok, GAtResult *result, gpointer user_data)
@@ -573,9 +768,7 @@ static void cfun_enable(gboolean ok, GAtResult *result, gpointer user_data)
 		return;
 	}
 
-	data->cpin_ready = g_at_chat_register(data->aux, "+CPIN", cpin_notify,
-						FALSE, modem, NULL);
-	g_at_chat_send(data->aux, "AT+CPIN?", cpin_prefix, cpin_query, modem,
+	g_at_chat_send(data->aux, "AT+CFUN=4", none_prefix, cfun_cb, modem,
 			NULL);
 }
 
@@ -619,6 +812,30 @@ static void cfun_query(gboolean ok, GAtResult *result, gpointer user_data)
 		cfun_enable(TRUE, NULL, modem);
 }
 
+static void setup_aux(struct ofono_modem *modem)
+{
+	struct quectel_data *data = ofono_modem_get_data(modem);
+
+	DBG("%p", modem);
+
+	g_at_chat_set_slave(data->modem, data->aux);
+
+	if (data->model == QUECTEL_EC21) {
+		g_at_chat_send(data->aux, "ATE0; &C0; +CMEE=1", none_prefix,
+				NULL, NULL, NULL);
+		g_at_chat_send(data->aux, "AT+QURCCFG=\"urcport\",\"uart1\"", none_prefix,
+				NULL, NULL, NULL);
+	} else if (data->model == QUECTEL_EC200) {
+		g_at_chat_send(data->aux, "ATE0; &C0; +CMEE=1", none_prefix,
+				NULL, NULL, NULL);
+	} else
+		g_at_chat_send(data->aux, "ATE0; &C0; +CMEE=1; +QIURC=0",
+				none_prefix, NULL, NULL, NULL);
+
+	g_at_chat_send(data->aux, "AT+CFUN?", cfun_prefix, cfun_query, modem,
+			NULL);
+}
+
 static void cgmm_cb(int ok, GAtResult *result, void *user_data)
 {
 	struct ofono_modem *modem = user_data;
@@ -645,75 +862,31 @@ static void cgmm_cb(int ok, GAtResult *result, void *user_data)
 		DBG("%p model MC60", modem);
 		data->vendor = OFONO_VENDOR_QUECTEL_SERIAL;
 		data->model = QUECTEL_MC60;
+	} else if (strcmp(model, "EC21") == 0) {
+		DBG("%p model EC21", modem);
+		data->vendor = OFONO_VENDOR_QUECTEL_EC2X;
+		data->model = QUECTEL_EC21;
+	} else if (strstr(model, "EC200")) {
+		DBG("%p model %s", modem, model);
+		data->vendor = OFONO_VENDOR_QUECTEL_EC2X;
+		data->model = QUECTEL_EC200;
 	} else {
 		ofono_warn("%p unknown model: '%s'", modem, model);
 		data->vendor = OFONO_VENDOR_QUECTEL;
 		data->model = QUECTEL_UNKNOWN;
 	}
 
-	g_at_chat_send(data->aux, "AT+CFUN?", cfun_prefix, cfun_query, modem,
+	setup_aux(modem);
+}
+
+static void identify_model(struct ofono_modem *modem)
+{
+	struct quectel_data *data = ofono_modem_get_data(modem);
+
+	DBG("%p", modem);
+
+	g_at_chat_send(data->aux, "AT+CGMM", cgmm_prefix, cgmm_cb, modem,
 			NULL);
-}
-
-static void qinistat_cb(gboolean ok, GAtResult *result, gpointer user_data)
-{
-	struct ofono_modem *modem = user_data;
-	struct quectel_data *data = ofono_modem_get_data(modem);
-	GAtResultIter iter;
-	int status;
-
-	DBG("%p", modem);
-
-	g_at_result_iter_init(&iter, result);
-
-	if (!g_at_result_iter_next(&iter, "+QINISTAT:"))
-		return;
-
-	if (!g_at_result_iter_next_number(&iter, &status))
-		return;
-
-	DBG("qinistat: %d", status);
-
-	if (status != 3) {
-		l_timeout_modify_ms(data->sms_ready_timer, 500);
-		return;
-	}
-
-	ofono_sms_create(modem, data->vendor, "atmodem", data->aux);
-	l_timeout_remove(data->sms_ready_timer);
-	data->sms_ready_timer = NULL;
-}
-
-static void sms_ready_cb(struct l_timeout *timeout, void *user_data)
-{
-	struct ofono_modem *modem = user_data;
-	struct quectel_data *data = ofono_modem_get_data(modem);
-
-	DBG("%p", modem);
-
-	g_at_chat_send(data->aux, "AT+QINISTAT", qinistat_prefix, qinistat_cb,
-			modem, NULL);
-}
-
-static void call_ready_notify(GAtResult *result, void *user_data)
-{
-	struct ofono_modem *modem = user_data;
-	struct quectel_data *data = ofono_modem_get_data(modem);
-
-	DBG("%p", modem);
-
-	g_at_chat_unregister(data->aux, data->call_ready);
-	data->call_ready = 0;
-	data->sms_ready_timer = l_timeout_create_ms(500, sms_ready_cb, modem,
-							NULL);
-	if (!data->sms_ready_timer) {
-		close_serial(modem);
-		return;
-	}
-
-	ofono_phonebook_create(modem, 0, "atmodem", data->aux);
-	ofono_voicecall_create(modem, 0, "atmodem", data->aux);
-	ofono_call_volume_create(modem, 0, "atmodem", data->aux);
 }
 
 static int open_ttys(struct ofono_modem *modem)
@@ -735,24 +908,71 @@ static int open_ttys(struct ofono_modem *modem)
 		return -EIO;
 	}
 
-	data->call_ready = g_at_chat_register(data->aux, "Call Ready",
-						call_ready_notify, false,
-						modem, NULL);
-	if (!data->call_ready) {
-		close_serial(modem);
-		return -ENOTTY;
-	}
-
-	g_at_chat_set_slave(data->modem, data->aux);
-
-	g_at_chat_send(data->modem, "ATE0; &C0; +CMEE=1", none_prefix, NULL,
-			NULL, NULL);
-	g_at_chat_send(data->aux, "ATE0; &C0; +CMEE=1", none_prefix, NULL, NULL,
-			NULL);
-	g_at_chat_send(data->aux, "AT+CGMM", cgmm_prefix, cgmm_cb, modem,
-			NULL);
+	identify_model(modem);
 
 	return -EINPROGRESS;
+}
+
+static GAtChat *create_chat(struct ofono_modem *modem, char *debug)
+{
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	GIOChannel *channel;
+	GAtSyntax *syntax;
+	GAtChat *chat;
+
+	DBG("%p", modem);
+
+	channel = g_at_mux_create_channel(data->mux);
+	if (channel == NULL)
+		return NULL;
+
+	syntax = g_at_syntax_new_gsmv1();
+	chat = g_at_chat_new(channel, syntax);
+	g_at_syntax_unref(syntax);
+	g_io_channel_unref(channel);
+
+	if (chat == NULL)
+		return NULL;
+
+	if (getenv("OFONO_AT_DEBUG"))
+		g_at_chat_set_debug(chat, quectel_debug, debug);
+
+	return chat;
+}
+
+static void cmux_gatmux(struct ofono_modem *modem)
+{
+	struct quectel_data *data = ofono_modem_get_data(modem);
+
+	DBG("%p", modem);
+
+	data->mux = g_at_mux_new_gsm0710_basic(data->device, 127);
+	if (data->mux == NULL) {
+		ofono_error("failed to create gsm0710 mux");
+		close_serial(modem);
+		return;
+	}
+
+	if (getenv("OFONO_MUX_DEBUG"))
+		g_at_mux_set_debug(data->mux, quectel_debug, "Mux: ");
+
+	g_at_mux_start(data->mux);
+
+	data->modem = create_chat(modem, "Modem: ");
+	if (!data->modem) {
+		ofono_error("failed to create modem channel");
+		close_serial(modem);
+		return;
+	}
+
+	data->aux = create_chat(modem, "Aux: ");
+	if (!data->aux) {
+		ofono_error("failed to create aux channel");
+		close_serial(modem);
+		return;
+	}
+
+	identify_model(modem);
 }
 
 static void mux_ready_cb(struct l_timeout *timeout, void *user_data)
@@ -787,19 +1007,16 @@ static void mux_ready_cb(struct l_timeout *timeout, void *user_data)
 	g_at_chat_set_slave(data->uart, data->modem);
 }
 
-static void cmux_cb(gboolean ok, GAtResult *result, gpointer user_data)
+static void cmux_ngsm(struct ofono_modem *modem)
 {
-	struct ofono_modem *modem = user_data;
 	struct quectel_data *data = ofono_modem_get_data(modem);
 	struct gsm_config gsm_config;
-	GIOChannel *device;
 	int ldisc = N_GSM0710;
 	int fd;
 
 	DBG("%p", modem);
 
-	device = g_at_chat_get_channel(data->uart);
-	fd = g_io_channel_unix_get_fd(device);
+	fd = g_io_channel_unix_get_fd(data->device);
 
 	/* get initial line discipline to restore after use */
 	if (ioctl(fd, TIOCGETD, &data->initial_ldisc) < 0) {
@@ -845,14 +1062,47 @@ static void cmux_cb(gboolean ok, GAtResult *result, gpointer user_data)
 	 * the kernel does not yet support mapping the underlying serial device
 	 * to its virtual gsm ttys, so hard-code gsmtty1 gsmtty2 for now
 	 */
-	ofono_modem_set_string(modem, "Aux", "/dev/gsmtty1");
-	ofono_modem_set_string(modem, "Modem", "/dev/gsmtty2");
+	ofono_modem_set_string(modem, "Modem", "/dev/gsmtty1");
+	ofono_modem_set_string(modem, "Aux", "/dev/gsmtty2");
 
 	/* wait for gsmtty devices to appear */
 	if (!l_timeout_create_ms(100, mux_ready_cb, modem, NULL)) {
 		close_serial(modem);
 		return;
 	}
+}
+
+static void cmux_cb(gboolean ok, GAtResult *result, gpointer user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	const char *mux = ofono_modem_get_string(modem, "Mux");
+
+	DBG("%p", modem);
+
+	g_at_chat_unref(data->uart);
+	data->uart = NULL;
+
+	if (!ok) {
+		close_serial(modem);
+		return;
+	}
+
+	if (!mux)
+		mux = "internal";
+
+	if (strcmp(mux, "n_gsm") == 0) {
+		cmux_ngsm(modem);
+		return;
+	}
+
+	if (strcmp(mux, "internal") == 0) {
+		cmux_gatmux(modem);
+		return;
+	}
+
+	ofono_error("unsupported mux setting: '%s'", mux);
+	close_serial(modem);
 }
 
 static void ate_cb(int ok, GAtResult *result, void *user_data)
@@ -862,9 +1112,59 @@ static void ate_cb(int ok, GAtResult *result, void *user_data)
 
 	DBG("%p", modem);
 
-	g_at_chat_set_wakeup_command(data->uart, NULL, 0, 0);
 	g_at_chat_send(data->uart, "AT+CMUX=0,0,5,127,10,3,30,10,2", NULL,
-			cmux_cb, modem, NULL);
+		cmux_cb, modem, NULL);
+}
+
+static void init_cmd_cb(gboolean ok, GAtResult *result, void *user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+	const char *rts_cts;
+
+	DBG("%p", modem);
+
+	if (!ok)
+		return;
+
+	rts_cts = ofono_modem_get_string(modem, "RtsCts");
+
+	if (strcmp(rts_cts, "on") == 0)
+		g_at_chat_send(data->uart, "AT+IFC=2,2; E0", none_prefix,
+				ate_cb, modem, NULL);
+	else
+		g_at_chat_send(data->uart, "ATE0", none_prefix, ate_cb, modem,
+				NULL);
+
+	l_timeout_remove(data->init_timeout);
+	data->init_timeout = NULL;
+}
+
+static void init_timeout_cb(struct l_timeout *timeout, void *user_data)
+{
+	struct ofono_modem *modem = user_data;
+	struct quectel_data *data = ofono_modem_get_data(modem);
+
+	DBG("%p", modem);
+
+	if (data->init_count++ >= 30) {
+		ofono_error("failed to init modem after 30 attempts");
+		close_serial(modem);
+		return;
+	}
+
+	g_at_chat_retry(data->uart, data->init_cmd);
+	l_timeout_modify_ms(timeout, 500);
+}
+
+static void gpio_power_on_cb(struct l_timeout *timeout, void *user_data)
+{
+	struct quectel_data *data = user_data;
+	const uint32_t gpio_value = 0;
+
+	l_timeout_remove(timeout);
+	data->gpio_timeout = NULL;
+	l_gpio_writer_set(data->gpio, 1, &gpio_value);
 }
 
 static int open_serial(struct ofono_modem *modem)
@@ -872,6 +1172,8 @@ static int open_serial(struct ofono_modem *modem)
 	struct quectel_data *data = ofono_modem_get_data(modem);
 	const uint32_t gpio_value = 1;
 	const char *rts_cts;
+	ssize_t written;
+	int fd;
 
 	DBG("%p", modem);
 
@@ -891,10 +1193,26 @@ static int open_serial(struct ofono_modem *modem)
 	if (data->uart == NULL)
 		return -EINVAL;
 
+	data->device = g_at_chat_get_channel(data->uart);
+	g_io_channel_ref(data->device);
+
+	/*
+	 * terminate gsm 0710 multiplexing on the modem side to make sure it
+	 * responds to plain AT commands
+	 * */
+	fd = g_io_channel_unix_get_fd(data->device);
+	written = write(fd, gsm0710_terminate, sizeof(gsm0710_terminate));
+	if (written != sizeof(gsm0710_terminate))
+		ofono_warn("Failed to terminate gsm multiplexing");
+
 	if (data->gpio && !l_gpio_writer_set(data->gpio, 1, &gpio_value)) {
 		close_serial(modem);
 		return -EIO;
 	}
+
+	if (data->gpio && !ofono_modem_get_boolean(modem, "GpioLevel"))
+		data->gpio_timeout = l_timeout_create_ms(2100, gpio_power_on_cb,
+							 data, NULL);
 
 	/*
 	 * there are three different power-up scenarios:
@@ -910,18 +1228,15 @@ static int open_serial(struct ofono_modem *modem)
 	 *     a few 'AT' bytes to detect the host UART bitrate, but the RDY is
 	 *     lost.
 	 *
-	 * the wakeup command feature is (mis)used to support all three
-	 * scenarious by sending AT commands until the modem responds with OK,
-	 * at which point the modem is ready.
+	 * Handle all three cases by issuing a plain AT command. The modem
+	 * answers with OK when it is ready. Create a timer to re-issue
+	 * the AT command at regular intervals until the modem answers.
 	 */
-	g_at_chat_set_wakeup_command(data->uart, "AT\r", 500, 10000);
-
-	if (strcmp(rts_cts, "on") == 0)
-		g_at_chat_send(data->uart, "AT+IFC=2,2; E0", none_prefix,
-				ate_cb, modem, NULL);
-	else
-		g_at_chat_send(data->uart, "ATE0", none_prefix, ate_cb, modem,
-				NULL);
+	data->init_count = 0;
+	data->init_cmd = g_at_chat_send(data->uart, "AT", none_prefix,
+					init_cmd_cb, modem, NULL);
+	data->init_timeout = l_timeout_create_ms(500, init_timeout_cb, modem,
+							NULL);
 
 	return -EINPROGRESS;
 }
@@ -930,7 +1245,7 @@ static int quectel_enable(struct ofono_modem *modem)
 {
 	DBG("%p", modem);
 
-	if (ofono_modem_get_string(modem, "Device"))
+	if (has_serial_connection(modem))
 		return open_serial(modem);
 	else
 		return open_ttys(modem);
@@ -1005,11 +1320,16 @@ static void quectel_pre_sim(struct ofono_modem *modem)
 
 	DBG("%p", modem);
 
-	ofono_devinfo_create(modem, 0, "atmodem", data->aux);
+	ofono_devinfo_create(modem, data->vendor, "atmodem", data->aux);
+
+	ofono_voicecall_create(modem, data->vendor, "atmodem", data->aux);
 	sim = ofono_sim_create(modem, data->vendor, "atmodem", data->aux);
 
-	if (sim && data->have_sim == true)
-		ofono_sim_inserted_notify(sim, TRUE);
+	if (data->sim_locked || data->sim_ready)
+		ofono_sim_inserted_notify(sim, true);
+
+	if (data->sim_ready)
+		ofono_sim_initialized_notify(sim);
 }
 
 static void quectel_post_sim(struct ofono_modem *modem)
@@ -1026,6 +1346,15 @@ static void quectel_post_sim(struct ofono_modem *modem)
 
 	if (gprs && gc)
 		ofono_gprs_add_context(gprs, gc);
+
+	ofono_sms_create(modem, data->vendor, "atmodem", data->aux);
+	ofono_phonebook_create(modem, data->vendor, "atmodem", data->aux);
+	ofono_call_volume_create(modem, data->vendor, "atmodem", data->aux);
+
+	if (data->model == QUECTEL_EC21 || data->model == QUECTEL_EC200) {
+		ofono_ussd_create(modem, data->vendor, "atmodem", data->aux);
+		ofono_lte_create(modem, data->vendor, "atmodem", data->aux);
+	}
 }
 
 static void quectel_post_online(struct ofono_modem *modem)
@@ -1034,7 +1363,7 @@ static void quectel_post_online(struct ofono_modem *modem)
 
 	DBG("%p", modem);
 
-	ofono_netreg_create(modem, 0, "atmodem", data->aux);
+	ofono_netreg_create(modem, data->vendor, "atmodem", data->aux);
 }
 
 static struct ofono_modem_driver quectel_driver = {

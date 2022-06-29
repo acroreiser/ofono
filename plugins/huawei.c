@@ -419,6 +419,10 @@ static void sysinfo_enable_cb(gboolean ok, GAtResult *result,
 	g_at_chat_send(data->modem, "AT&C0", NULL, NULL, NULL, NULL);
 	g_at_chat_send(data->pcui, "AT&C0", NULL, NULL, NULL, NULL);
 
+	/* Restore settings after restart */
+	g_at_chat_send(data->modem, "AT&F0", NULL, NULL, NULL, NULL);
+	g_at_chat_send(data->pcui, "AT&F0", NULL, NULL, NULL, NULL);
+
 	/*
 	 * Ensure that the modem is using GSM character set and not IRA,
 	 * otherwise weirdness with umlauts and other non-ASCII characters
@@ -583,9 +587,6 @@ static void modem_disconnect(gpointer user_data)
 	g_at_chat_unref(data->modem);
 	data->modem = NULL;
 
-	/* close gprs context driver */
-	ofono_gprs_context_remove(data->gc);
-
 	/* reopen modem channel */
 	data->modem = open_device(modem, "Modem", "Modem: ");
 
@@ -593,6 +594,10 @@ static void modem_disconnect(gpointer user_data)
 		DBG("Can't reopen device");
 		return;
 	}
+
+	/* close previous gprs context driver */
+	if (data->gc)
+		ofono_gprs_context_remove(data->gc);
 
 	/* configure modem channel */
 	g_at_chat_set_disconnect_function(data->modem, modem_disconnect, modem);

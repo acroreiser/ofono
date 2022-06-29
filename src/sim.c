@@ -47,6 +47,7 @@
 #include "storage.h"
 #include "simfs.h"
 #include "stkutil.h"
+#include "missing.h"
 
 /*
  * A new session object will be created if a USim/ISim applications are
@@ -1182,7 +1183,7 @@ static void sim_iidf_read_cb(int ok, int length, int record,
 		clut_len = data[3] * 3;
 
 	iidf_id = efimg[3] << 8 | efimg[4];
-	sim->iidf_image = g_memdup(data, length);
+	sim->iidf_image = g_memdup2(data, length);
 
 	/* The path it the same between 2G and 3G */
 	path_len = sim_ef_db_get_path_3g(SIM_EFIMG_FILEID, path);
@@ -1664,7 +1665,8 @@ static void impi_read_cb(int ok, int total_length, int record,
 		return;
 	}
 
-	sim->impi = g_strndup((const char *)data + 2, data[1]);
+	if (validate_utf8_tlv(data))
+		sim->impi = g_strndup((const char *)data + 2, data[1]);
 }
 
 static void discover_apps_cb(const struct ofono_error *error,
@@ -1924,7 +1926,7 @@ static void sim_efsst_read_cb(int ok, int length, int record,
 		goto out;
 	}
 
-	sim->efsst = g_memdup(data, length);
+	sim->efsst = g_memdup2(data, length);
 	sim->efsst_length = length;
 
 	/*
@@ -1963,7 +1965,7 @@ static void sim_efest_read_cb(int ok, int length, int record,
 		goto out;
 	}
 
-	sim->efest = g_memdup(data, length);
+	sim->efest = g_memdup2(data, length);
 	sim->efest_length = length;
 
 	/*
@@ -2007,7 +2009,7 @@ static void sim_efust_read_cb(int ok, int length, int record,
 		goto out;
 	}
 
-	sim->efust = g_memdup(data, length);
+	sim->efust = g_memdup2(data, length);
 	sim->efust_length = length;
 
 	/*
@@ -2150,7 +2152,7 @@ static void sim_efli_read_cb(int ok, int length, int record,
 	if (!ok)
 		return;
 
-	sim->efli = g_memdup(data, length);
+	sim->efli = g_memdup2(data, length);
 	sim->efli_length = length;
 }
 
@@ -3201,7 +3203,7 @@ static void sim_pin_query_cb(const struct ofono_error *error,
 	DBusConnection *conn = ofono_dbus_get_connection();
 	const char *path = __ofono_atom_get_path(sim->atom);
 	struct cached_pin *cpins = pin_cache_lookup(sim->iccid);
-	const char *pin_name = sim_passwd_name(pin_type);
+	const char *pin_name;
 	char **locked_pins;
 	gboolean lock_changed;
 
@@ -3211,6 +3213,8 @@ static void sim_pin_query_cb(const struct ofono_error *error,
 		ofono_error("Querying PIN authentication state failed");
 		return;
 	}
+
+	pin_name = sim_passwd_name(pin_type);
 
 	if (sim->pin_type != pin_type) {
 		sim->pin_type = pin_type;
@@ -3802,7 +3806,8 @@ void __ofono_sim_remove_session_watch(struct ofono_sim_aid_session *session,
 {
 	__ofono_watchlist_remove_item(session->watches, id);
 
-	if (g_slist_length(session->watches->items) == 0) {
+	if (g_slist_length(session->watches->items) == 0 &&
+			session->state == SESSION_STATE_OPEN) {
 		/* last watcher, close session */
 		session->state = SESSION_STATE_CLOSING;
 		session->sim->driver->close_channel(session->sim,

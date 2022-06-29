@@ -39,6 +39,7 @@
 #include "gattty.h"
 
 #include "huaweimodem.h"
+#include "src/missing.h"
 
 static const char *none_prefix[] = { NULL };
 static const char *dhcp_prefix[] = { "^DHCP:", NULL };
@@ -234,7 +235,7 @@ static void at_cgdcont_cb(gboolean ok, GAtResult *result, gpointer user_data)
 		return;
 	}
 
-	ncbd = g_memdup(cbd, sizeof(struct cb_data));
+	ncbd = g_memdup2(cbd, sizeof(struct cb_data));
 
 	snprintf(buf, sizeof(buf), "AT^NDISDUP=%u,1", gcd->active_context);
 
@@ -255,7 +256,7 @@ static void huawei_gprs_activate_primary(struct ofono_gprs_context *gc,
 {
 	struct gprs_context_data *gcd = ofono_gprs_context_get_data(gc);
 	struct cb_data *cbd = cb_data_new(cb, data);
-	char buf[64];
+	char buf[136];
 
 	/* IPv6 support not implemented */
 	if (ctx->proto != OFONO_GPRS_PROTO_IP)

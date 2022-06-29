@@ -199,6 +199,7 @@ static void at_sim_read_info(struct ofono_sim *sim, int fileid,
 	case OFONO_VENDOR_SPEEDUP:
 	case OFONO_VENDOR_QUALCOMM_MSM:
 	case OFONO_VENDOR_SIMCOM:
+	case OFONO_VENDOR_DROID:
 		/* Maximum possible length */
 		len += sprintf(buf + len, ",0,0,255");
 		break;
@@ -1213,6 +1214,7 @@ static void at_pin_retries_query(struct ofono_sim *sim,
 			return;
 		break;
 	case OFONO_VENDOR_QUECTEL:
+	case OFONO_VENDOR_QUECTEL_EC2X:
 		if (g_at_chat_send(sd->chat, "AT+QPINC?", qpinc_prefix,
 					at_qpinc_cb, cbd, g_free) > 0)
 			return;
@@ -1354,7 +1356,6 @@ static void at_pin_send_cb(gboolean ok, GAtResult *result,
 	case OFONO_VENDOR_HUAWEI:
 	case OFONO_VENDOR_SIMCOM:
 	case OFONO_VENDOR_SIERRA:
-	case OFONO_VENDOR_QUECTEL_SERIAL:
 		/*
 		 * On ZTE modems, after pin is entered, SIM state is checked
 		 * by polling CPIN as their modem doesn't provide unsolicited

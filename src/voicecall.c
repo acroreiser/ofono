@@ -38,6 +38,7 @@
 #include "simutil.h"
 #include "smsutil.h"
 #include "storage.h"
+#include "missing.h"
 
 #define MAX_VOICE_CALLS 16
 
@@ -2417,7 +2418,7 @@ void ofono_voicecall_notify(struct ofono_voicecall *vc,
 
 	__ofono_modem_callid_hold(modem, call->id);
 
-	newcall = g_memdup(call, sizeof(struct ofono_call));
+	newcall = g_memdup2(call, sizeof(struct ofono_call));
 	if (newcall == NULL) {
 		ofono_error("Unable to allocate call");
 		goto error;

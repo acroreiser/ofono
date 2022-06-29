@@ -337,6 +337,7 @@ static inline void at_ack_delivery(struct ofono_sms *sms)
 	if (data->cnma_ack_pdu) {
 		switch (data->vendor) {
 		case OFONO_VENDOR_GEMALTO:
+		case OFONO_VENDOR_QUECTEL_EC2X:
 			snprintf(buf, sizeof(buf), "AT+CNMA=1");
 			break;
 		case OFONO_VENDOR_QUECTEL_SERIAL:
@@ -463,7 +464,8 @@ static void at_cmt_notify(GAtResult *result, gpointer user_data)
 	decode_hex_own_buf(hexpdu, -1, &pdu_len, 0, pdu);
 	ofono_sms_deliver_notify(sms, pdu, pdu_len, tpdu_len);
 
-	if (data->vendor != OFONO_VENDOR_SIMCOM)
+	if (data->vendor != OFONO_VENDOR_SIMCOM &&
+			data->vendor != OFONO_VENDOR_DROID)
 		at_ack_delivery(sms);
 	return;
 
@@ -844,6 +846,9 @@ static gboolean build_cnmi_string(char *buf, int *cnmi_opts,
 	case OFONO_VENDOR_HUAWEI:
 	case OFONO_VENDOR_ZTE:
 	case OFONO_VENDOR_SIMCOM:
+	case OFONO_VENDOR_QUECTEL:
+	case OFONO_VENDOR_QUECTEL_EC2X:
+	case OFONO_VENDOR_DROID:
 		/* MSM devices advertise support for mode 2, but return an
 		 * error if we attempt to actually use it. */
 		mode = "1";
@@ -857,9 +862,15 @@ static gboolean build_cnmi_string(char *buf, int *cnmi_opts,
 	if (!append_cnmi_element(buf, &len, cnmi_opts[0], mode, FALSE))
 		return FALSE;
 
+	mode = "21";
+	if (!data->cnma_enabled)
+		mode = "1";
+
+	if (data->vendor == OFONO_VENDOR_DROID)
+		mode = "2";
+
 	/* Prefer to deliver SMS via +CMT if CNMA is supported */
-	if (!append_cnmi_element(buf, &len, cnmi_opts[1],
-					data->cnma_enabled ? "21" : "1", FALSE))
+	if (!append_cnmi_element(buf, &len, cnmi_opts[1], mode, FALSE))
 		return FALSE;
 
 	switch (data->vendor) {
@@ -1289,6 +1300,8 @@ static void at_csms_query_cb(gboolean ok, GAtResult *result,
 		goto out;
 
 	switch (data->vendor) {
+	case OFONO_VENDOR_DROID:
+		break;
 	case OFONO_VENDOR_QUECTEL_SERIAL:
 		g_at_result_iter_next_number(&iter, &status_min);
 		g_at_result_iter_next_number(&iter, &status_max);

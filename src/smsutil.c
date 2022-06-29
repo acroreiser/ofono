@@ -38,6 +38,7 @@
 #include "util.h"
 #include "storage.h"
 #include "smsutil.h"
+#include "missing.h"
 
 #define uninitialized_var(x) x = x
 
@@ -1756,7 +1757,7 @@ gboolean sms_udh_iter_init_from_cbs(const struct cbs *cbs,
 		return FALSE;
 
 	hdr = cbs->ud;
-	max_ud_len = 82;
+	max_ud_len = cbs->udlen;
 
 	/* Must have at least one information-element if udhi is true */
 	if (hdr[0] < 2)
@@ -2814,7 +2815,7 @@ static void sr_assembly_load_backup(GHashTable *assembly_table,
 	}
 
 	/* Node ready, create key and add them to the table */
-	id_table_key = g_memdup(msgid, SMS_MSGID_LEN);
+	id_table_key = g_memdup2(msgid, SMS_MSGID_LEN);
 
 	g_hash_table_insert(id_table, id_table_key, node);
 }
@@ -3129,7 +3130,7 @@ void status_report_assembly_add_fragment(
 
 	/* Create node in the message id hashtable if required */
 	if (node == NULL) {
-		id_table_key = g_memdup(msgid, SMS_MSGID_LEN);
+		id_table_key = g_memdup2(msgid, SMS_MSGID_LEN);
 
 		node = g_new0(struct id_table_node, 1);
 		node->total_mrs = total_mrs;
@@ -3240,7 +3241,7 @@ static GSList *sms_tx_load(const char *imsi, const struct dirent *dir)
 		if (sms_deserialize_outgoing(buf, &s, r) == FALSE)
 			goto free_pdu;
 
-		list = g_slist_prepend(list, g_memdup(&s, sizeof(s)));
+		list = g_slist_prepend(list, g_memdup2(&s, sizeof(s)));
 
 free_pdu:
 		g_free(pdus[len]);
@@ -3575,6 +3576,7 @@ GSList *sms_text_prepare_with_alphabet(const char *to, const char *utf8,
 	GSList *r = NULL;
 	enum gsm_dialect used_locking;
 	enum gsm_dialect used_single;
+	enum gsm_dialect dialect;
 
 	memset(&template, 0, sizeof(struct sms));
 	template.type = SMS_TYPE_SUBMIT;
@@ -3586,12 +3588,14 @@ GSList *sms_text_prepare_with_alphabet(const char *to, const char *utf8,
 	template.submit.vp.relative = 0xA7; /* 24 Hours */
 	sms_address_from_string(&template.submit.daddr, to);
 
+	/* There are two enums for the same thing */
+	dialect = (enum gsm_dialect)alphabet;
 	/*
 	 * UDHI, UDL, UD and DCS actually depend on the contents of
 	 * the text, and also on the GSM dialect we use to encode it.
 	 */
 	gsm_encoded = convert_utf8_to_gsm_best_lang(utf8, -1, NULL, &written, 0,
-							alphabet, &used_locking,
+							dialect, &used_locking,
 							&used_single);
 	if (!gsm_encoded) {
 		size_t converted;
@@ -3862,8 +3866,8 @@ gboolean cbs_dcs_decode(guint8 dcs, gboolean *udhi, enum sms_class *cls,
 
 gboolean cbs_decode(const unsigned char *pdu, int len, struct cbs *out)
 {
-	/* CBS is always a fixed length of 88 bytes */
-	if (len != 88)
+	/* CBS is (almost) always a fixed length of 88 bytes */
+	if (len < 6 || len > 88)
 		return FALSE;
 
 	out->gs = (enum cbs_geo_scope) ((pdu[0] >> 6) & 0x03);
@@ -3873,6 +3877,10 @@ gboolean cbs_decode(const unsigned char *pdu, int len, struct cbs *out)
 	out->dcs = pdu[4];
 	out->max_pages = pdu[5] & 0xf;
 	out->page = (pdu[5] >> 4) & 0xf;
+
+	/* Allow the last fragment to be truncated */
+	if (len != 88 && out->max_pages != out->page)
+		return FALSE;
 
 	/*
 	 * If a mobile receives the code 0000 in either the first field or
@@ -3885,7 +3893,10 @@ gboolean cbs_decode(const unsigned char *pdu, int len, struct cbs *out)
 		out->page = 1;
 	}
 
-	memcpy(out->ud, pdu + 6, 82);
+	out->udlen = (guint8)(len - 6);
+	memcpy(out->ud, pdu + 6, out->udlen);
+	if (out->udlen < 82)
+		memset(out->ud + out->udlen, 0, 82 - out->udlen);
 
 	return TRUE;
 }
@@ -4078,7 +4089,7 @@ char *cbs_decode_text(GSList *cbs_list, char *iso639_lang)
 			if (iso639)
 				bufsize -= 3;
 		} else {
-			bufsize += 82;
+			bufsize += cbs->udlen;
 
 			if (iso639)
 				bufsize -= 2;
@@ -4095,7 +4106,7 @@ char *cbs_decode_text(GSList *cbs_list, char *iso639_lang)
 			if (sms_udh_iter_init_from_cbs(cbs, &iter))
 				taken = sms_udh_iter_get_udh_length(&iter) + 1;
 
-			unpack_7bit_own_buf(cbs->ud + taken, 82 - taken,
+			unpack_7bit_own_buf(cbs->ud + taken, cbs->udlen - taken,
 						taken, false, 2,
 						NULL, 0,
 						(unsigned char *)iso639_lang);
@@ -4128,7 +4139,7 @@ char *cbs_decode_text(GSList *cbs_list, char *iso639_lang)
 			max_chars =
 				sms_text_capacity_gsm(CBS_MAX_GSM_CHARS, taken);
 
-			unpack_7bit_own_buf(ud + taken, 82 - taken,
+			unpack_7bit_own_buf(ud + taken, cbs->udlen - taken,
 						taken, false, max_chars,
 						&written, 0, unpacked);
 
@@ -4162,7 +4173,7 @@ char *cbs_decode_text(GSList *cbs_list, char *iso639_lang)
 			 * the check here since the specification isn't clear
 			 */
 		} else {
-			int num_ucs2_chars = (82 - taken) >> 1;
+			int num_ucs2_chars = (cbs->udlen - taken) >> 1;
 			int i = taken;
 			int max_offset = taken + num_ucs2_chars * 2;
 

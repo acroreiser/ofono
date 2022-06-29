@@ -38,6 +38,7 @@
 #include "gatresult.h"
 
 #include "mbmmodem.h"
+#include "src/missing.h"
 
 #define MBM_E2NAP_DISCONNECTED 0
 #define MBM_E2NAP_CONNECTED 1
@@ -345,7 +346,7 @@ static void mbm_cgdcont_cb(gboolean ok, GAtResult *result, gpointer user_data)
 		return;
 	}
 
-	ncbd = g_memdup(cbd, sizeof(struct cb_data));
+	ncbd = g_memdup2(cbd, sizeof(struct cb_data));
 
 	snprintf(buf, sizeof(buf), "AT*ENAP=1,%u", gcd->active_context);
 
